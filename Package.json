@@ -1,0 +1,10 @@
+{
+  "name": "crypto-signal-bot",
+  "version": "1.0.0",
+  "description": "A simple crypto signal bot deployed on Vercel",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {}
+}
