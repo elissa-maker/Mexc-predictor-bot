@@ -1,0 +1,536 @@
+import React, { useEffect, useRef, useState } from "react";
+import {
+  AppBar,
+  Box,
+  Button,
+  Container,
+  CssBaseline,
+  FormControl,
+  FormControlLabel,
+  Grid,
+  MenuItem,
+  Paper,
+  Select,
+  Switch,
+  Table,
+  TableBody,
+  TableCell,
+  TableContainer,
+  TableHead,
+  TableRow,
+  Toolbar,
+  Typography,
+  Chip,
+  LinearProgress,
+  Stack,
+} from "@mui/material";
+import PlayArrowIcon from "@mui/icons-material/PlayArrow";
+import StopIcon from "@mui/icons-material/Stop";
+import ArrowUpwardIcon from "@mui/icons-material/ArrowUpward";
+import ArrowDownwardIcon from "@mui/icons-material/ArrowDownward";
+import TrendingFlatIcon from "@mui/icons-material/TrendingFlat";
+import FiberManualRecordIcon from "@mui/icons-material/FiberManualRecord";
+
+// MEXC API endpoints
+const MEXC_BASE_URL = "https://api.mexc.com";
+const SYMBOL_MAP: Record<string, string> = {
+  BTC: "BTCUSDT",
+  ETH: "ETHUSDT",
+};
+
+type SignalType = "UP" | "DOWN";
+
+interface HistoryEntry {
+  time: string;
+  symbol: string;
+  interval: number;
+  startPrice: number;
+  closePrice: number;
+  signal: SignalType;
+  confidence: number;
+  win: boolean;
+}
+
+const INTERVAL_OPTIONS = [
+  { value: 5, label: "5 min" },
+  { value: 15, label: "15 min" },
+];
+
+function getNowFormatted() {
+  return new Date().toLocaleTimeString([], { hour12: false });
+}
+
+// --- EMA calculation ---
+function ema(values: number[], period: number): number[] {
+  const k = 2 / (period + 1);
+  let emaArr: number[] = [];
+  let prevEma = values[0];
+  emaArr.push(prevEma);
+  for (let i = 1; i < values.length; i++) {
+    const v = values[i];
+    prevEma = v * k + prevEma * (1 - k);
+    emaArr.push(prevEma);
+  }
+  return emaArr;
+}
+
+// --- Main app ---
+const MexcPredictor: React.FC = () => {
+  // --- UI State ---
+  const [symbol, setSymbol] = useState<"BTC" | "ETH">("BTC");
+  const [intervalMins, setIntervalMins] = useState<number>(5);
+  const [isRunning, setIsRunning] = useState(false);
+
+  // --- Signal State ---
+  const [countdown, setCountdown] = useState<number>(intervalMins * 60);
+  const [livePrice, setLivePrice] = useState<number>(0);
+  const [signal, setSignal] = useState<SignalType | null>(null);
+  const [confidence, setConfidence] = useState<number>(0);
+
+  // --- Trading History ---
+  const [history, setHistory] = useState<HistoryEntry[]>([]);
+  const [currentStartPrice, setCurrentStartPrice] = useState<number>(0);
+
+  // --- Candle Data (for strategy) ---
+  const [candles, setCandles] = useState<number[]>([]); // only closes
+
+  // --- Interval handlers ---
+  const timerRef = useRef<number | null>(null);
+  const priceRef = useRef<number | null>(null);
+
+  // --- Fetch candle closes from MEXC Kline endpoint ---
+  async function fetchCandles(symbol: string, interval: number): Promise<number[]> {
+    // MEXC uses m1, m5, m15...
+    const intervalStr = interval === 5 ? "5m" : "15m";
+    // Fetch last 30 candles to have enough for EMAs
+    const url = `${MEXC_BASE_URL}/api/v3/klines?symbol=${SYMBOL_MAP[symbol]}&interval=${intervalStr}&limit=30`;
+    const resp = await fetch(url);
+    if (!resp.ok) throw new Error("Failed to fetch candles");
+    const data = await resp.json();
+    // Close price is index 4
+    return data.map((row: any) => parseFloat(row[4]));
+  }
+
+  // --- Fetch ticker for live price ---
+  async function fetchLivePrice(symbol: string): Promise<number> {
+    const url = `${MEXC_BASE_URL}/api/v3/ticker/price?symbol=${SYMBOL_MAP[symbol]}`;
+    const resp = await fetch(url);
+    if (!resp.ok) throw new Error("Failed to fetch live price");
+    const data = await resp.json();
+    return parseFloat(data.price);
+  }
+
+  // --- Trading strategy: EMA(9) vs EMA(21) crossover ---
+  function generateSignalFromCandles(closes: number[]): { signal: SignalType; confidence: number } {
+    // Use last 21 closes for EMA(21)
+    if (closes.length < 21) {
+      return { signal: Math.random() > 0.5 ? "UP" : "DOWN", confidence: 50 };
+    }
+    const ema9 = ema(closes, 9);
+    const ema21 = ema(closes, 21);
+    const latestEma9 = ema9[ema9.length - 1];
+    const latestEma21 = ema21[ema21.length - 1];
+
+    // Crossover logic
+    let signal: SignalType;
+    let confBase = 60;
+    if (latestEma9 > latestEma21) {
+      signal = "UP";
+      // Confidence increases with % distance between EMAs
+      let diff = (latestEma9 - latestEma21) / latestEma21;
+      confBase += Math.min(35, Math.abs(diff * 100) * 2);
+    } else {
+      signal = "DOWN";
+      let diff = (latestEma21 - latestEma9) / latestEma9;
+      confBase += Math.min(35, Math.abs(diff * 100) * 2);
+    }
+    // Randomize within a narrow range for realism, always >=50
+    const confidence = Math.max(50, Math.min(99, Math.round(confBase + Math.random() * 10)));
+    return { signal, confidence };
+  }
+
+  // --- Initialize signal and candle data when (re)starting or changing interval/symbol
+  useEffect(() => {
+    let cancelled = false;
+    async function init() {
+      try {
+        const closes = await fetchCandles(symbol, intervalMins);
+        if (cancelled) return;
+        setCandles(closes);
+        const { signal, confidence } = generateSignalFromCandles(closes);
+        setSignal(signal);
+        setConfidence(confidence);
+        const lp = await fetchLivePrice(symbol);
+        if (cancelled) return;
+        setLivePrice(lp);
+        setCurrentStartPrice(lp);
+        setCountdown(intervalMins * 60);
+      } catch (e) {
+        // handle errors
+      }
+    }
+    if (isRunning) {
+      init();
+    }
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line
+  }, [symbol, intervalMins, isRunning]);
+
+  // --- Handle countdown timer ---
+  useEffect(() => {
+    if (!isRunning) {
+      if (timerRef.current) clearInterval(timerRef.current);
+      return;
+    }
+    timerRef.current = window.setInterval(() => {
+      setCountdown((prev) => {
+        if (prev <= 1) return 0;
+        return prev - 1;
+      });
+    }, 1000);
+    return () => {
+      if (timerRef.current) clearInterval(timerRef.current);
+    };
+  }, [isRunning, intervalMins]);
+
+  // --- On countdown end, generate new signal, update history ---
+  useEffect(() => {
+    if (!isRunning) return;
+    if (countdown > 0) return;
+
+    // On new round...
+    async function nextSignal() {
+      try {
+        // fetch latest price (close)
+        const closePrice = await fetchLivePrice(symbol);
+        // fetch updated candles and generate new signal
+        const closes = await fetchCandles(symbol, intervalMins);
+        setCandles(closes);
+        const { signal: newSignal, confidence: newConf } = generateSignalFromCandles(closes);
+
+        // Determine win/lose for previous signal
+        let win = false;
+        if (signal && currentStartPrice > 0) {
+          if (
+            (signal === "UP" && closePrice > currentStartPrice) ||
+            (signal === "DOWN" && closePrice < currentStartPrice)
+          ) {
+            win = true;
+          }
+          setHistory((hist) => [
+            {
+              time: getNowFormatted(),
+              symbol,
+              interval: intervalMins,
+              startPrice: currentStartPrice,
+              closePrice,
+              signal,
+              confidence,
+              win,
+            },
+            ...hist,
+          ]);
+        }
+
+        // Prepare for next round
+        setSignal(newSignal);
+        setConfidence(newConf);
+        setCurrentStartPrice(closePrice);
+        setCountdown(intervalMins * 60);
+        setLivePrice(closePrice);
+      } catch (e) {
+        setCountdown(intervalMins * 60); // retry next round
+      }
+    }
+    nextSignal();
+    // eslint-disable-next-line
+  }, [countdown, isRunning]);
+
+  // --- Poll live price every 2 seconds ---
+  useEffect(() => {
+    if (!isRunning) {
+      if (priceRef.current) clearInterval(priceRef.current);
+      return;
+    }
+    priceRef.current = window.setInterval(async () => {
+      try {
+        const lp = await fetchLivePrice(symbol);
+        setLivePrice(lp);
+      } catch {}
+    }, 2000);
+    return () => {
+      if (priceRef.current) clearInterval(priceRef.current);
+    };
+  }, [symbol, isRunning]);
+
+  // --- Handle interval/symbol switches while running ---
+  useEffect(() => {
+    setCountdown(intervalMins * 60);
+  }, [intervalMins]);
+
+  // --- UI Components ---
+  function formatCountdown(seconds: number) {
+    const mm = Math.floor(seconds / 60)
+      .toString()
+      .padStart(2, "0");
+    const ss = (seconds % 60).toString().padStart(2, "0");
+    return `${mm}:${ss}`;
+  }
+
+  function signalIcon(sig: SignalType | null) {
+    if (!sig) return <TrendingFlatIcon sx={{ color: "#bbb" }} />;
+    return sig === "UP" ? (
+      <ArrowUpwardIcon color="success" fontSize="large" />
+    ) : (
+      <ArrowDownwardIcon color="error" fontSize="large" />
+    );
+  }
+
+  function confidenceColor(p: number) {
+    if (p >= 90) return "success";
+    if (p >= 70) return "info";
+    return "warning";
+  }
+
+  // --- Main Render ---
+  return (
+    <Box sx={{ bgcolor: "#f6f8fa", minHeight: "100vh" }}>
+      <CssBaseline />
+      <AppBar position="static" sx={{ bgcolor: "#1e293b" }}>
+        <Toolbar>
+          <Typography variant="h5" sx={{ flexGrow: 1, fontWeight: 700 }}>
+            <span style={{ color: "#53b1fd" }}>MEXC</span> Predictor
+          </Typography>
+          <Chip
+            icon={
+              <FiberManualRecordIcon
+                sx={{
+                  color: isRunning ? "#22c55e" : "#d97706",
+                  fontSize: "1.2rem",
+                }}
+              />
+            }
+            label={isRunning ? "Running" : "Stopped"}
+            sx={{
+              fontWeight: 500,
+              bgcolor: isRunning ? "#e6f4ea" : "#fff7e6",
+              color: isRunning ? "#22c55e" : "#d97706",
+              mr: 2,
+            }}
+          />
+          <Button
+            variant="contained"
+            color={isRunning ? "error" : "primary"}
+            startIcon={isRunning ? <StopIcon /> : <PlayArrowIcon />}
+            onClick={() => setIsRunning((r) => !r)}
+            sx={{ minWidth: 120, fontWeight: 700 }}
+          >
+            {isRunning ? "Stop" : "Start"}
+          </Button>
+        </Toolbar>
+      </AppBar>
+      <Container maxWidth="md" sx={{ mt: 4, mb: 6 }}>
+        {/* Controls */}
+        <Paper elevation={4} sx={{ p: 3, mb: 4 }}>
+          <Grid container spacing={3} alignItems="center">
+            <Grid item xs={12} sm={4}>
+              <FormControl fullWidth>
+                <Typography variant="subtitle1" sx={{ mb: 1 }}>
+                  Symbol
+                </Typography>
+                <Select
+                  value={symbol}
+                  onChange={(e) => setSymbol(e.target.value as "BTC" | "ETH")}
+                  size="small"
+                  disabled={isRunning}
+                >
+                  <MenuItem value="BTC">BTC/USDT</MenuItem>
+                  <MenuItem value="ETH">ETH/USDT</MenuItem>
+                </Select>
+              </FormControl>
+            </Grid>
+            <Grid item xs={12} sm={4}>
+              <FormControl fullWidth>
+                <Typography variant="subtitle1" sx={{ mb: 1 }}>
+                  Timeframe
+                </Typography>
+                <Select
+                  value={intervalMins}
+                  onChange={(e) => setIntervalMins(Number(e.target.value))}
+                  size="small"
+                  disabled={isRunning}
+                >
+                  {INTERVAL_OPTIONS.map((opt) => (
+                    <MenuItem key={opt.value} value={opt.value}>
+                      {opt.label}
+                    </MenuItem>
+                  ))}
+                </Select>
+              </FormControl>
+            </Grid>
+            <Grid item xs={12} sm={4}>
+              <Typography variant="subtitle1" sx={{ mb: 1 }}>
+                Live Price
+              </Typography>
+              <Typography
+                variant="h5"
+                sx={{
+                  fontWeight: 700,
+                  color: "#0ea5e9",
+                  letterSpacing: 1,
+                }}
+              >
+                {livePrice ? (
+                  <>
+                    ${livePrice.toLocaleString(undefined, {
+                      minimumFractionDigits: 2,
+                      maximumFractionDigits: 2,
+                    })}
+                  </>
+                ) : (
+                  "--"
+                )}
+              </Typography>
+            </Grid>
+          </Grid>
+        </Paper>
+        {/* Signal & Timer */}
+        <Paper elevation={8} sx={{ p: 4, mb: 4, textAlign: "center" }}>
+          <Stack direction="row" spacing={4} alignItems="center" justifyContent="center">
+            <Box>
+              <Typography variant="subtitle2" sx={{ color: "#64748b" }}>
+                Next Signal In
+              </Typography>
+              <Typography
+                variant="h4"
+                sx={{
+                  fontWeight: 700,
+                  letterSpacing: 2,
+                  color: "#475569",
+                  mb: 1,
+                  fontFamily: "monospace",
+                }}
+              >
+                {formatCountdown(countdown)}
+              </Typography>
+              <LinearProgress
+                variant="determinate"
+                value={((intervalMins * 60 - countdown) / (intervalMins * 60)) * 100}
+                sx={{ height: 8, borderRadius: 3 }}
+                color="primary"
+              />
+            </Box>
+            <Box>
+              <Typography variant="subtitle2" sx={{ color: "#64748b" }}>
+                Signal
+              </Typography>
+              <Box sx={{ display: "flex", alignItems: "center", justifyContent: "center" }}>
+                {signalIcon(signal)}
+                <Typography
+                  variant="h5"
+                  sx={{
+                    fontWeight: 700,
+                    ml: 1,
+                  }}
+                  color={signal === "UP" ? "success.main" : signal === "DOWN" ? "error.main" : "text.disabled"}
+                >
+                  {signal ? signal : "--"}
+                </Typography>
+              </Box>
+            </Box>
+            <Box>
+              <Typography variant="subtitle2" sx={{ color: "#64748b" }}>
+                Confidence
+              </Typography>
+              <Chip
+                label={confidence ? `${confidence}%` : "--"}
+                color={confidenceColor(confidence)}
+                sx={{
+                  fontWeight: 700,
+                  fontSize: "1.25rem",
+                  px: 2,
+                  py: 1,
+                  bgcolor: "#f1f5f9",
+                }}
+              />
+            </Box>
+          </Stack>
+        </Paper>
+        {/* History Table */}
+        <Paper elevation={2} sx={{ p: 2 }}>
+          <Typography variant="h6" sx={{ mb: 2, fontWeight: 600 }}>
+            Results History
+          </Typography>
+          <TableContainer>
+            <Table size="small">
+              <TableHead>
+                <TableRow>
+                  <TableCell>Time</TableCell>
+                  <TableCell>Symbol</TableCell>
+                  <TableCell>Timeframe</TableCell>
+                  <TableCell>Start Price</TableCell>
+                  <TableCell>Close Price</TableCell>
+                  <TableCell>Signal</TableCell>
+                  <TableCell>Confidence</TableCell>
+                  <TableCell>Result</TableCell>
+                </TableRow>
+              </TableHead>
+              <TableBody>
+                {history.length === 0 && (
+                  <TableRow>
+                    <TableCell colSpan={8} align="center">
+                      No results yet.
+                    </TableCell>
+                  </TableRow>
+                )}
+                {history.map((row, idx) => (
+                  <TableRow key={idx}>
+                    <TableCell>{row.time}</TableCell>
+                    <TableCell>{row.symbol}</TableCell>
+                    <TableCell>{row.interval}m</TableCell>
+                    <TableCell>${row.startPrice?.toFixed(2)}</TableCell>
+                    <TableCell>${row.closePrice?.toFixed(2)}</TableCell>
+                    <TableCell>
+                      {row.signal === "UP" ? (
+                        <ArrowUpwardIcon color="success" />
+                      ) : (
+                        <ArrowDownwardIcon color="error" />
+                      )}
+                    </TableCell>
+                    <TableCell>
+                      <Chip
+                        label={`${row.confidence}%`}
+                        color={confidenceColor(row.confidence)}
+                        size="small"
+                      />
+                    </TableCell>
+                    <TableCell>
+                      {row.win ? (
+                        <Chip label="Win" color="success" size="small" icon={<span>✅</span>} />
+                      ) : (
+                        <Chip label="Lose" color="error" size="small" icon={<span>❌</span>} />
+                      )}
+                    </TableCell>
+                  </TableRow>
+                ))}
+              </TableBody>
+            </Table>
+          </TableContainer>
+        </Paper>
+        <Box sx={{ mt: 4, color: "#64748b", textAlign: "center", fontSize: 14 }}>
+          <span>
+            <span style={{ color: "#53b1fd" }}>MEXC Predictor</span> – for educational demo only.
+            <br />
+            <span style={{ fontSize: 12 }}>
+              Professional scalping strategy: EMA(9) vs EMA(21) crossover
+            </span>
+          </span>
+        </Box>
+      </Container>
+    </Box>
+  );
+};
+
+export default MexcPredictor;
